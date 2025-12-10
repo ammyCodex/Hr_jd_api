@@ -65,7 +65,7 @@ class JDRequest(BaseModel):
 
 class MatchRequest(BaseModel):
     job_description: str
-    candidate_profile: str
+    candidate_profile: str = None  # Optional if resume_file is provided
 
 class OfferEmailRequest(BaseModel):
     candidate_name: str
@@ -199,22 +199,77 @@ def generate_questions(req: JDRequest):
 
 # Match candidate
 @app.post("/match-candidate")
-def match_candidate(req: MatchRequest):
+async def match_candidate(job_description: str = Body(...), candidate_profile: str = Body(None), resume_file: UploadFile = File(None)):
+    # If resume file is provided, parse it first
+    if resume_file:
+        # Read file content
+        content = await resume_file.read()
+        filename = resume_file.filename.lower()
+        if filename.endswith('.pdf'):
+            # Extract text from PDF
+            with pdfplumber.open(BytesIO(content)) as pdf:
+                resume_text = ''
+                for page in pdf.pages:
+                    resume_text += page.extract_text() or ''
+        else:
+            # Assume text file
+            try:
+                resume_text = content.decode('utf-8')
+            except UnicodeDecodeError:
+                resume_text = content.decode('latin-1')  # Fallback encoding
+        
+        # Parse resume using LLM
+        parse_prompt = f"""
+        Parse this resume text and extract the following information in a clean, HR-friendly JSON format:
+
+        Required fields:
+        - name: Full name of the candidate
+        - email: Email address (if available, otherwise empty string)
+        - phone: Phone number (if available, otherwise empty string)
+        - experience_years: Total years of professional experience (integer)
+        - skills: List of technical and soft skills mentioned
+        - education: Highest education qualification (string)
+        - certifications: List of certifications (if any)
+        - summary: A concise 2-3 sentence professional summary suitable for candidate matching
+
+        Output only valid JSON matching this structure. If information is not available, use appropriate defaults.
+
+        Resume:
+        {resume_text}
+        """
+        parse_resp = co.chat(
+            messages=[{"role": "user", "content": parse_prompt}],
+            model="command-r-plus-08-2024",
+            max_tokens=500
+        )
+        
+        # Parse the JSON response
+        import json
+        try:
+            parsed = json.loads(parse_resp.message.content[0].text.strip())
+            candidate_profile = parsed.get('summary', resume_text)  # Use summary for matching
+        except:
+            candidate_profile = resume_text  # Fallback to original text
+    
+    elif not candidate_profile:
+        raise HTTPException(status_code=400, detail="Either candidate_profile or resume_file must be provided")
+    
     prompt = f"""
     Compare the job description with the candidate profile.
     Provide:
-    - Match percentage
+    - Match percentage (0-100)
     - Missing skills
-    - Strengths
+    - Key strengths
+    - Overall assessment
     Output strictly in clean JSON.
 
-    JD: {req.job_description}
-    Candidate: {req.candidate_profile}
+    JD: {job_description}
+    Candidate: {candidate_profile}
     """
     resp = co.chat(
         messages=[{"role": "user", "content": prompt}],
         model="command-r-plus-08-2024",
-        max_tokens=300
+        max_tokens=400
     )
     return {"match_result": resp.message.content[0].text.strip()}
 
