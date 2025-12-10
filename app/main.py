@@ -2,8 +2,10 @@ import os
 import numpy as np
 from typing import List, Dict
 import cohere
+import pdfplumber
+from io import BytesIO
 from sklearn.preprocessing import normalize
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -11,10 +13,6 @@ load_dotenv()
 
 COHERE_API_KEY = os.getenv("COHERE_API_KEY", "")
 co = cohere.ClientV2(api_key=COHERE_API_KEY)
-
-# -----------------------------
-# Matching Logic with Embeddings
-# -----------------------------
 
 def _embed_texts(texts: List[str]) -> List[List[float]]:
     resp = co.embed(texts=texts, model="embed-multilingual-v3.0", input_type="search_document")
@@ -81,6 +79,20 @@ class RejectionEmailRequest(BaseModel):
     job_title: str
     hr_name: str
     reason: str = "We regret to inform you that we will not be moving forward with your application at this time."
+
+class ResumeParseRequest(BaseModel):
+    resume_text: str = None  # Optional for file upload
+
+class ParsedResume(BaseModel):
+    name: str
+    email: str = ""
+    phone: str = ""
+    experience_years: int = 0
+    skills: List[str] = []
+    education: str = ""
+    certifications: List[str] = []
+    summary: str  # Formatted text for matching
+
 class BulkMatchRequest(BaseModel):
     job_description: str
     candidates: List[str]  # each candidate profile as string
@@ -92,6 +104,64 @@ class BulkMatchRequest(BaseModel):
 @app.get("/")
 def root():
     return {"message": "HR Agent API running successfully!"}
+
+# Parse resume
+@app.post("/parse-resume", response_model=ParsedResume)
+async def parse_resume(resume_text: str = Body(None), resume_file: UploadFile = File(None)):
+    if resume_file:
+        # Read file content
+        content = await resume_file.read()
+        filename = resume_file.filename.lower()
+        if filename.endswith('.pdf'):
+            # Extract text from PDF
+            with pdfplumber.open(BytesIO(content)) as pdf:
+                resume_text = ''
+                for page in pdf.pages:
+                    resume_text += page.extract_text() or ''
+        else:
+            # Assume text file
+            try:
+                resume_text = content.decode('utf-8')
+            except UnicodeDecodeError:
+                resume_text = content.decode('latin-1')  # Fallback encoding
+    elif not resume_text:
+        raise HTTPException(status_code=400, detail="Either resume_text or resume_file must be provided")
+    
+    prompt = f"""
+    Parse this resume text and extract the following information in a clean, HR-friendly JSON format:
+
+    Required fields:
+    - name: Full name of the candidate
+    - email: Email address (if available, otherwise empty string)
+    - phone: Phone number (if available, otherwise empty string)
+    - experience_years: Total years of professional experience (integer)
+    - skills: List of technical and soft skills mentioned
+    - education: Highest education qualification (string)
+    - certifications: List of certifications (if any)
+    - summary: A concise 2-3 sentence professional summary suitable for candidate matching
+
+    Output only valid JSON matching this structure. If information is not available, use appropriate defaults.
+
+    Resume:
+    {resume_text}
+    """
+    resp = co.chat(
+        messages=[{"role": "user", "content": prompt}],
+        model="command-r-plus-08-2024",
+        max_tokens=500
+    )
+    
+    # Parse the JSON response
+    import json
+    try:
+        parsed = json.loads(resp.message.content[0].text.strip())
+        return ParsedResume(**parsed)
+    except:
+        # Fallback if JSON parsing fails
+        return ParsedResume(
+            name="Unknown",
+            summary=resp.message.content[0].text.strip()
+        )
 
 # Extract skills
 @app.post("/extract-skills")
