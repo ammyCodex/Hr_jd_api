@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+cohere
+python-multipart
+pydantic
+numpy
+python-dotenv
+requests
+scikit-learn
